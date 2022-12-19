@@ -1,0 +1,137 @@
+<#
+.SYNOPSIS
+    Checks if single session AVD hosts are in use, if not they will be shutdown.
+.DESCRIPTION
+	This script checks if the VMs in the supplied Hostpool have active user sessions. If not, the session host will be shut down.
+	Therefore the System Identity needs the following RBAC rigths in the Azure tennant:
+		- Virtual Machine Contributor on VMRessourceGroup
+		- Desktop Virtualization Contributor on Hostpool
+	The following Powershell modules are required:
+		- Az.Accounts
+		- Az.Compute
+		- Az.DesktopVirtualization
+.PARAMETER HostPoolName
+	Name of the hotpool the virtual machines belong to.
+.PARAMETER ResourceGroupName
+	The RessourceGroup that contains the hostpool.
+.PARAMETER Subscription
+	The Subscription of the hostpool.
+.NOTES
+	- Unassign User after VM shutdown -> currently not possible
+#>
+
+Param (
+	[Parameter (Mandatory = $true)]
+	[String] $HostPoolName,
+	[Parameter (Mandatory = $true)]
+	[String] $ResourceGroupName,
+	[Parameter (Mandatory = $true)]
+	[String] $Subscription
+)
+
+$errorActionPreference = "Stop"
+Write-Output ("Running script on: " + $env:computername)
+
+function Unassign-User 
+{
+    [CmdletBinding()]
+   	Param(
+       	[Parameter(Mandatory)]
+        [String]$HostPoolName,
+       
+   	    [Parameter(Mandatory)]
+       	[String]$ResourceGroupName,
+       
+        [Parameter(Mandatory)]
+   	    [String]$Subscription,
+
+        [Parameter(Mandatory)]
+   	    [String]$HostName,
+
+        [Parameter(Mandatory)]
+   	    [String]$Token
+   	)
+    $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+    $session.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/106.0.0.0 Safari/537.36 Edg/106.0.1370.47"
+    try {
+        $result = Invoke-WebRequest  -UseBasicParsing -Uri "https://management.azure.com/subscriptions/$Subscription/resourcegroups/$ResourceGroupName/providers/Microsoft.DesktopVirtualization/hostpools/$HostPoolName/sessionhosts/$($HostName)?api-version=2022-02-10-preview&force=true" `
+        -Method "PATCH" `
+        -WebSession $session `
+        -Headers @{
+        "Authorization"="Bearer $Token"
+        "Accept"="*/*"
+        } `
+        -ContentType "application/json" `
+        -Body "{`"properties`": {`"allowNewSession`": true,`"assignedUser`": `"`"}}" `
+    }catch{
+        $ErrorMessage = $PSItem.Exception.message
+        Write-Error ("Could not fetch webrequest: "+$ErrorMessage)
+        exit(1)
+        Break
+    }
+    if($result.StatusCode -eq "200"){
+        Write-Output "Unassigned session host $HostName"
+    }
+}
+
+#Connect to Azure with the identity of the automation account
+try {
+    Write-Output ("Connecting to Azure Account...")
+    Connect-AzAccount `
+    -Identity `
+    -SubscriptionId $Subscription `
+    -ErrorAction Stop| Out-Null 
+}
+catch {
+    $ErrorMessage = $PSItem.Exception.message
+    Write-Error ("Could not connect to Azure Account: "+$ErrorMessage)
+    exit(1)
+    Break
+}
+
+try {
+    Write-Output ("Getting access token...")
+    $Token = (Get-AzAccessToken).Token
+}
+catch {
+    $ErrorMessage = $PSItem.Exception.message
+    Write-Error ("Could not get access token: "+$ErrorMessage)
+    exit(1)
+    Break
+}
+
+$AVDHostList = @()
+$AVDHosts = Get-AzWvdSessionHost -ResourceGroupName $ResourceGroupName -HostPoolName $HostPoolName
+
+foreach ($Item in $AVDHosts){
+	$HostName = $Item.Name.Split("/")[1]
+	$Session = Get-AzWvdUserSession -HostPoolName $HostPoolName -ResourceGroupName $ResourceGroupName -SessionHostName $HostName
+    if(!$Session){
+        Write-Output("No session on " + $HostName + " repurposing VM...")
+        $VM = Get-AzVM -Name $HostName
+        $provisioningState = (Get-AzVM -ResourceGroupName $VM.ResourceGroupName  -Name $HostName -Status).Statuses[1].Code
+        if($provisioningState -eq "PowerState/running"){
+            $time = (Get-AzVM -ResourceGroupName $VM.ResourceGroupName  -Name $HostName -Status).Statuses[0].Time
+            if(!$time){
+                $time = Get-Date
+            }
+            $timenow = Get-Date
+            $difference = $timenow - $time
+            if($difference.Minutes -gt 5 -Or $difference.Hours -ge 1 -Or $difference.Days -ge 1){
+                Write-Output("Session host $HostName is running, shutting down...")
+                Stop-AzVM -Name $HostName -ResourceGroupName $VM.ResourceGroupName -Force
+                # Update-AzWvdSessionHost -HostPoolName $HostPoolName -ResourceGroupName $ResourceGroupName -Name $HostName -AssignedUser "" -Force command broken by MS
+                Write-Output("Unassigning user...")
+                Unassign-User -HostPoolName $HostPoolName -ResourceGroupName $ResourceGroupName -Subscription $Subscription -HostName $HostName -Token $Token
+            }else{
+                Write-Output("Host $HostName was started less than 5 minutes ago, will not shut down host.")
+            }
+        }elseif($provisioningState -eq "PowerState/deallocated"){
+            Write-Output("Session host $HostName is deallocated, unassigning user...")
+            # Update-AzWvdSessionHost -HostPoolName $HostPoolName -ResourceGroupName $ResourceGroupName -Name $HostName -AssignedUser "" -Force command broken by MS
+            Unassign-User -HostPoolName $HostPoolName -ResourceGroupName $ResourceGroupName -Subscription $Subscription -HostName $HostName -Token $Token
+        }
+    }else{
+        Write-Output("Session remaining on " + $HostName)
+    }
+}
